@@ -1,57 +1,28 @@
 # coding: utf-8
 # ============================================================
 # POPULATE LOCATION WITH DIRECTION
-# Description: Uses Generate Near Table twice --
-#   1) nearest EG_MAD address  -> address + direction (NEAR_ANGLE)
-#   2) nearest EG_STREETS line -> the street the feature sits on
-# Then populates LOCATION as "street, direction address"
-# e.g. "Bond RD, N/O 9201 OPAL CREST CT"
-# No joins -- no field name corruption.
+# Description: Uses Generate Near Table to find the closest
+# EG_MAD address within 300 ft, then populates LOCATION as
+# "direction + address" (e.g. "W/O 8765 Elk Grove Blvd")
+# using NEAR_FID for the address and NEAR_ANGLE for direction.
+# No joins — no field name corruption.
 # ============================================================
 
-import traceback
 import arcpy
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# -- Settings ------------------------------------------------
-ADDRESS_SEARCH_RADIUS = "300 Feet"   # how far to look for an EG_MAD address
-STREET_SEARCH_RADIUS  = "300 Feet"   # how far to look for an EG_STREETS line
-ADDRESS_FIELD = "FULLADDRES"         # field on EG_MAD
-STREET_FIELD  = "FULLSTREET"         # field on EG_STREETS
-
 aprx = arcpy.mp.ArcGISProject("CURRENT")
 map_obj = aprx.activeMap
 
-feature_layers = [l for l in map_obj.listLayers() if l.isFeatureLayer]
-layer_list = [l.longName for l in feature_layers]
+def get_layer_path(map_obj):
+    paths = {}
+    for l in map_obj.listLayers():
+        if l.isFeatureLayer:
+            paths[l.longName] = l.longName
+    return paths
 
-def find_layer(wanted):
-    """Find a feature layer by name, ignoring case and any DB prefix
-    (so 'EG_STREETS' also matches 'GIS.EG_STREETS')."""
-    wanted_short = wanted.lower().split(".")[-1]
-    for l in feature_layers:                              # exact name
-        if l.name.lower() == wanted.lower():
-            return l
-    for l in feature_layers:                              # prefixed name
-        if l.name.lower().split(".")[-1] == wanted_short:
-            return l
-    return None
-
-def layer_from_choice(choice):
-    """Turn a dropdown value (longName) back into the layer object."""
-    for l in feature_layers:
-        if l.longName == choice:
-            return l
-    return find_layer(choice.split("\\")[-1])
-
-def default_layer_name(wanted):
-    lyr = find_layer(wanted)
-    return lyr.longName if lyr else ""
-
-def field_names(layer):
-    """Field names for a layer, without relying on ListFields(layer object)."""
-    return [f.name.upper() for f in arcpy.Describe(layer).fields]
+layer_list = list(get_layer_path(map_obj).keys())
 
 def angle_to_direction(angle):
     if angle is None:
@@ -65,148 +36,120 @@ def angle_to_direction(angle):
     else:
         return "E/O"
 
-def normalize(text):
-    """Loose compare helper: upper case, strip punctuation/extra spaces."""
-    if not text:
-        return ""
-    cleaned = "".join(c if c.isalnum() else " " for c in str(text).upper())
-    return " ".join(cleaned.split())
-
 # -- Build the Popup UI --------------------------------------
 root = tk.Tk()
 root.title("Populate LOCATION with Direction")
-root.geometry("620x420")
-root.minsize(520, 380)
-
-# Run button is packed FIRST against the bottom so it can never be
-# pushed off-screen by the fields above it.
-button_frame = tk.Frame(root)
-button_frame.pack(side="bottom", fill="x", pady=10)
+root.geometry("500x150")
 
 tk.Label(root, text="-- Select Target Layer --", font=("Arial", 9, "bold")).pack(pady=(10, 2))
 
 selected_layer = tk.StringVar()
-layer_dropdown = ttk.Combobox(root, textvariable=selected_layer, values=layer_list, width=68)
+layer_dropdown = ttk.Combobox(root, textvariable=selected_layer, values=layer_list, width=60)
 layer_dropdown.pack(pady=2)
 
-tk.Label(root, text="-- Address Layer (EG_MAD) --", font=("Arial", 9, "bold")).pack(pady=(10, 2))
-
-selected_address_layer = tk.StringVar(value=default_layer_name("EG_MAD"))
-address_dropdown = ttk.Combobox(root, textvariable=selected_address_layer, values=layer_list, width=68)
-address_dropdown.pack(pady=2)
-
-tk.Label(root, text="-- Street Layer (GIS.EG_STREETS) --", font=("Arial", 9, "bold")).pack(pady=(10, 2))
-
-selected_street_layer = tk.StringVar(value=default_layer_name("EG_STREETS"))
-street_dropdown = ttk.Combobox(root, textvariable=selected_street_layer, values=layer_list, width=68)
-street_dropdown.pack(pady=2)
-
-skip_same_street = tk.BooleanVar(value=True)
-tk.Checkbutton(
-    root,
-    text="Skip street prefix when the address is already on that street",
-    variable=skip_same_street
-).pack(pady=(8, 0))
-
-tk.Label(
-    root,
-    text="Nearest street FULLSTREET + nearest EG_MAD direction/FULLADDRES -> LOCATION",
-    font=("Arial", 8), fg="gray"
-).pack(pady=2)
-
-def near_lookup(target_layer, near_layer, radius, label):
-    """Run Generate Near Table and return {target_OID: (near_fid, near_angle)}."""
-    near_table = "memory/near_table_" + label
-    if arcpy.Exists(near_table):
-        arcpy.management.Delete(near_table)
-
-    print(f"Generating Near Table ({label})...")
-    arcpy.analysis.GenerateNearTable(
-        in_features=target_layer,
-        near_features=near_layer,
-        out_table=near_table,
-        search_radius=radius,
-        location="NO_LOCATION",
-        angle="ANGLE",
-        closest="CLOSEST",
-        method="PLANAR"
-    )
-
-    result = {}
-    with arcpy.da.SearchCursor(near_table, ["IN_FID", "NEAR_FID", "NEAR_ANGLE"]) as cursor:
-        for row in cursor:
-            result[row[0]] = (row[1], row[2])
-
-    if arcpy.Exists(near_table):
-        arcpy.management.Delete(near_table)
-
-    print(f"  Loaded {len(result)} near matches ({label})")
-    return result
-
-def value_lookup(layer, field, wanted_oids, label):
-    """Return {OID: field value} for the OIDs we actually matched."""
-    values = {}
-    with arcpy.da.SearchCursor(layer, ["OID@", field]) as cursor:
-        for row in cursor:
-            if row[0] in wanted_oids:
-                values[row[0]] = row[1]
-    print(f"  Loaded {len(values)} {label} values")
-    return values
+tk.Label(root, text="Nearest EG_MAD address ? direction + FULLADDRES ? LOCATION", font=("Arial", 8), fg="gray").pack(pady=2)
 
 def run():
     target = selected_layer.get()
-    address_target = selected_address_layer.get()
-    street_target = selected_street_layer.get()
 
     if not target:
         messagebox.showwarning("Missing", "Please select a target layer.")
         return
-    if not address_target:
-        messagebox.showwarning("Missing", "Please select the address layer (EG_MAD).")
-        return
-    if not street_target:
-        messagebox.showwarning("Missing", "Please select the street layer (EG_STREETS).")
-        return
 
-    skip_dupe = skip_same_street.get()
     root.destroy()
 
     editor = None
 
     try:
         # -- Resolve layer objects ----------------------------
-        target_layer = layer_from_choice(target)
-        eg_mad = layer_from_choice(address_target)
-        eg_streets = layer_from_choice(street_target)
+        layer_name = target.split("\\")[-1]
+        target_layer = map_obj.listLayers(layer_name)[0]
+        eg_mad = map_obj.listLayers("EG_MAD")[0]
 
-        for label, lyr in (("target", target_layer), ("address", eg_mad), ("street", eg_streets)):
-            if lyr is None:
-                raise ValueError(f"Could not resolve the {label} layer in this map")
+        # Street layer is optional — if it isn't in the map the
+        # script behaves exactly as it did before.
+        street_layers = map_obj.listLayers("*EG_STREETS")
+        eg_streets = street_layers[0] if street_layers else None
 
-        layer_name = target_layer.name
+        # -- STEP 1: Generate Near Table ----------------------
+        # Gets both NEAR_FID (to look up address) and NEAR_ANGLE (for direction)
+        near_table = "memory/near_table"
+        if arcpy.Exists(near_table):
+            arcpy.management.Delete(near_table)
 
-        # -- Field sanity check -------------------------------
-        if "LOCATION" not in field_names(target_layer):
-            raise ValueError(f"LOCATION field not found on {target_layer.name}")
-        if ADDRESS_FIELD.upper() not in field_names(eg_mad):
-            raise ValueError(f"{ADDRESS_FIELD} not found on {eg_mad.name}")
-        if STREET_FIELD.upper() not in field_names(eg_streets):
-            raise ValueError(f"{STREET_FIELD} not found on {eg_streets.name}")
-
-        # -- STEP 1: Near tables ------------------------------
-        # NEAR_FID -> which feature; NEAR_ANGLE -> direction (addresses only)
-        addr_near = near_lookup(target_layer, eg_mad, ADDRESS_SEARCH_RADIUS, "address")
-        street_near = near_lookup(target_layer, eg_streets, STREET_SEARCH_RADIUS, "street")
-
-        # -- STEP 2: Read the text values ---------------------
-        address_dict = value_lookup(
-            eg_mad, ADDRESS_FIELD, {v[0] for v in addr_near.values()}, "address"
+        print("Generating Near Table...")
+        arcpy.analysis.GenerateNearTable(
+            in_features=target_layer,
+            near_features=eg_mad,
+            out_table=near_table,
+            search_radius="300 Feet",
+            location="NO_LOCATION",
+            angle="ANGLE",
+            closest="CLOSEST",
+            method="PLANAR"
         )
-        street_dict = value_lookup(
-            eg_streets, STREET_FIELD, {v[0] for v in street_near.values()}, "street"
-        )
+        print("  Near Table generated")
 
-        # -- STEP 3: Open edit session ------------------------
+        # -- STEP 2: Read near table into dictionary ----------
+        # {target_OID: (near_fid, angle)}
+        near_dict = {}
+        with arcpy.da.SearchCursor(near_table, ["IN_FID", "NEAR_FID", "NEAR_ANGLE"]) as cursor:
+            for row in cursor:
+                near_dict[row[0]] = (row[1], row[2])
+
+        print(f"  Loaded {len(near_dict)} near matches")
+
+        # -- STEP 3: Read FULLADDRES from EG_MAD -------------
+        # {EG_MAD_OID: address}
+        address_dict = {}
+        near_fids = {v[0] for v in near_dict.values()}
+
+        with arcpy.da.SearchCursor(eg_mad, ["OID@", "FULLADDRES"]) as cursor:
+            for row in cursor:
+                if row[0] in near_fids:
+                    address_dict[row[0]] = row[1]
+
+        print(f"  Loaded {len(address_dict)} addresses from EG_MAD")
+
+        # -- STEP 3b: Nearest street name (silent) ------------
+        # Second near table against EG_STREETS purely to get the
+        # street the feature actually sits on. Any failure here is
+        # swallowed so LOCATION still gets its old value.
+        street_table = "memory/street_table"
+        street_near_dict = {}   # {target_OID: EG_STREETS_OID}
+        street_dict = {}        # {EG_STREETS_OID: FULLSTREET}
+
+        if eg_streets is not None:
+            try:
+                if arcpy.Exists(street_table):
+                    arcpy.management.Delete(street_table)
+
+                arcpy.analysis.GenerateNearTable(
+                    in_features=target_layer,
+                    near_features=eg_streets,
+                    out_table=street_table,
+                    search_radius="300 Feet",
+                    location="NO_LOCATION",
+                    angle="NO_ANGLE",
+                    closest="CLOSEST",
+                    method="PLANAR"
+                )
+
+                with arcpy.da.SearchCursor(street_table, ["IN_FID", "NEAR_FID"]) as cursor:
+                    for row in cursor:
+                        street_near_dict[row[0]] = row[1]
+
+                street_fids = set(street_near_dict.values())
+
+                with arcpy.da.SearchCursor(eg_streets, ["OID@", "FULLSTREET"]) as cursor:
+                    for row in cursor:
+                        if row[0] in street_fids:
+                            street_dict[row[0]] = row[1]
+            except Exception:
+                street_near_dict = {}
+                street_dict = {}
+
+        # -- STEP 4: Open edit session ------------------------
         desc = arcpy.Describe(target_layer)
         workspace = desc.path
         if arcpy.Describe(workspace).dataType == "FeatureDataset":
@@ -217,53 +160,49 @@ def run():
         editor.startEditing(False, True)
         editor.startOperation()
 
-        # -- STEP 4: LOCATION = "street, direction address" ---
+        # -- STEP 5: Update LOCATION = "direction + address" --
         updated = 0
         skipped = 0
-        no_street = 0
 
         with arcpy.da.UpdateCursor(target_layer, ["OID@", "LOCATION"]) as cursor:
             for row in cursor:
                 oid = row[0]
-                match = addr_near.get(oid)
+                match = near_dict.get(oid)
 
-                if not match:
-                    skipped += 1
-                    continue
+                if match:
+                    near_fid, angle = match
+                    address = address_dict.get(near_fid)
 
-                near_fid, angle = match
-                address = address_dict.get(near_fid)
+                    if address:
+                        direction = angle_to_direction(angle)
+                        street = street_dict.get(street_near_dict.get(oid))
 
-                if not address:
-                    skipped += 1
-                    continue
+                        if street:
+                            row[1] = f"{street}, {direction} {address}"
+                        else:
+                            row[1] = f"{direction} {address}"
 
-                direction = angle_to_direction(angle)
-                location = f"{direction} {address}"
-
-                street_match = street_near.get(oid)
-                street = street_dict.get(street_match[0]) if street_match else None
-
-                if street:
-                    # Don't repeat the street when the address is already on it
-                    if skip_dupe and normalize(street) in normalize(address):
-                        pass
+                        cursor.updateRow(row)
+                        updated += 1
                     else:
-                        location = f"{street}, {location}"
+                        skipped += 1
                 else:
-                    no_street += 1
+                    skipped += 1
 
-                row[1] = location
-                cursor.updateRow(row)
-                updated += 1
-
-        # -- STEP 5: Save edits -------------------------------
+        # -- STEP 6: Save edits -------------------------------
         editor.stopOperation()
         editor.stopEditing(True)
         editor = None
-        print(f"  Done! {updated} updated, {skipped} skipped, {no_street} without a street match")
+        print(f"  Done! {updated} updated, {skipped} skipped")
 
-        print(f"\nComplete - LOCATION set on {layer_name}")
+        # -- STEP 7: Cleanup ----------------------------------
+        if arcpy.Exists(near_table):
+            arcpy.management.Delete(near_table)
+        if arcpy.Exists(street_table):
+            arcpy.management.Delete(street_table)
+        print("  Near table deleted")
+
+        print(f"\nComplete — LOCATION set on {layer_name}")
 
     except Exception as e:
         if editor is not None:
@@ -272,14 +211,7 @@ def run():
                 editor.stopEditing(False)
             except Exception:
                 pass
-        # Print the full traceback so the real cause is visible, not just the
-        # last line -- and pop it up in case the console is hidden.
-        print("ERROR:")
-        traceback.print_exc()
-        try:
-            messagebox.showerror("Error", f"{e}\n\n{traceback.format_exc()}")
-        except Exception:
-            pass
+        print(f"ERROR: {e}")
 
-tk.Button(button_frame, text="Run", command=run, width=14).pack()
+tk.Button(root, text="Run", command=run).pack(pady=10)
 root.mainloop()
