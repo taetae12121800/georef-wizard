@@ -9,6 +9,7 @@
 # No joins -- no field name corruption.
 # ============================================================
 
+import traceback
 import arcpy
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -22,32 +23,35 @@ STREET_FIELD  = "FULLSTREET"         # field on EG_STREETS
 aprx = arcpy.mp.ArcGISProject("CURRENT")
 map_obj = aprx.activeMap
 
-def get_layer_path(map_obj):
-    paths = {}
-    for l in map_obj.listLayers():
-        if l.isFeatureLayer:
-            paths[l.longName] = l.longName
-    return paths
+feature_layers = [l for l in map_obj.listLayers() if l.isFeatureLayer]
+layer_list = [l.longName for l in feature_layers]
 
-layer_list = list(get_layer_path(map_obj).keys())
-
-def find_layer(map_obj, wanted):
+def find_layer(wanted):
     """Find a feature layer by name, ignoring case and any DB prefix
     (so 'EG_STREETS' also matches 'GIS.EG_STREETS')."""
-    wanted_l = wanted.lower()
-    layers = [l for l in map_obj.listLayers() if l.isFeatureLayer]
-    for l in layers:                                   # exact name
-        if l.name.lower() == wanted_l:
+    wanted_short = wanted.lower().split(".")[-1]
+    for l in feature_layers:                              # exact name
+        if l.name.lower() == wanted.lower():
             return l
-    for l in layers:                                   # prefixed name
-        short = l.name.lower().split(".")[-1]
-        if short == wanted_l.split(".")[-1]:
+    for l in feature_layers:                              # prefixed name
+        if l.name.lower().split(".")[-1] == wanted_short:
             return l
     return None
 
+def layer_from_choice(choice):
+    """Turn a dropdown value (longName) back into the layer object."""
+    for l in feature_layers:
+        if l.longName == choice:
+            return l
+    return find_layer(choice.split("\\")[-1])
+
 def default_layer_name(wanted):
-    lyr = find_layer(map_obj, wanted)
+    lyr = find_layer(wanted)
     return lyr.longName if lyr else ""
+
+def field_names(layer):
+    """Field names for a layer, without relying on ListFields(layer object)."""
+    return [f.name.upper() for f in arcpy.Describe(layer).fields]
 
 def angle_to_direction(angle):
     if angle is None:
@@ -71,7 +75,13 @@ def normalize(text):
 # -- Build the Popup UI --------------------------------------
 root = tk.Tk()
 root.title("Populate LOCATION with Direction")
-root.geometry("560x300")
+root.geometry("620x420")
+root.minsize(520, 380)
+
+# Run button is packed FIRST against the bottom so it can never be
+# pushed off-screen by the fields above it.
+button_frame = tk.Frame(root)
+button_frame.pack(side="bottom", fill="x", pady=10)
 
 tk.Label(root, text="-- Select Target Layer --", font=("Arial", 9, "bold")).pack(pady=(10, 2))
 
@@ -165,18 +175,22 @@ def run():
 
     try:
         # -- Resolve layer objects ----------------------------
-        layer_name = target.split("\\")[-1]
-        target_layer = map_obj.listLayers(layer_name)[0]
-        eg_mad = map_obj.listLayers(address_target.split("\\")[-1])[0]
-        eg_streets = map_obj.listLayers(street_target.split("\\")[-1])[0]
+        target_layer = layer_from_choice(target)
+        eg_mad = layer_from_choice(address_target)
+        eg_streets = layer_from_choice(street_target)
+
+        for label, lyr in (("target", target_layer), ("address", eg_mad), ("street", eg_streets)):
+            if lyr is None:
+                raise ValueError(f"Could not resolve the {label} layer in this map")
+
+        layer_name = target_layer.name
 
         # -- Field sanity check -------------------------------
-        mad_fields = [f.name.upper() for f in arcpy.ListFields(eg_mad)]
-        if ADDRESS_FIELD.upper() not in mad_fields:
+        if "LOCATION" not in field_names(target_layer):
+            raise ValueError(f"LOCATION field not found on {target_layer.name}")
+        if ADDRESS_FIELD.upper() not in field_names(eg_mad):
             raise ValueError(f"{ADDRESS_FIELD} not found on {eg_mad.name}")
-
-        street_fields = [f.name.upper() for f in arcpy.ListFields(eg_streets)]
-        if STREET_FIELD.upper() not in street_fields:
+        if STREET_FIELD.upper() not in field_names(eg_streets):
             raise ValueError(f"{STREET_FIELD} not found on {eg_streets.name}")
 
         # -- STEP 1: Near tables ------------------------------
@@ -258,7 +272,14 @@ def run():
                 editor.stopEditing(False)
             except Exception:
                 pass
-        print(f"ERROR: {e}")
+        # Print the full traceback so the real cause is visible, not just the
+        # last line -- and pop it up in case the console is hidden.
+        print("ERROR:")
+        traceback.print_exc()
+        try:
+            messagebox.showerror("Error", f"{e}\n\n{traceback.format_exc()}")
+        except Exception:
+            pass
 
-tk.Button(root, text="Run", command=run).pack(pady=10)
+tk.Button(button_frame, text="Run", command=run, width=14).pack()
 root.mainloop()
